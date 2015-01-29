@@ -5,6 +5,7 @@ set of objects and re-exported.
 """
 
 import re
+import shlex
 
 FILL_FG = 1
 FILL_BG = -1
@@ -42,6 +43,26 @@ PIN_CLOCKLOW = "CL"
 PIN_LOWOUT = "V"
 PIN_FALLING = "F"
 PIN_NONLOGIC = "NX"
+
+def readfile (f):
+    """Read in a file, returning a list of symbol objects."""
+    objects = []
+    while True:
+        obj = KicadSchSymbol.createFromLibFile (f)
+        if obj is None:
+            break
+        objects.append (obj)
+    return objects
+
+def writefile (f, objects):
+    """Write a list of objects out to a file."""
+    f.write ("EESchema-LIBRARY Version 2.3\n")
+    f.write ("#encoding utf-8\n")
+    for i in objects:
+        i.writeOut (f)
+    f.write ("#\n")
+    f.write ("#End Library\n")
+
 
 class KicadSchSymbol (object):
     """This represents a full schematic symbol. It contains a set of elements
@@ -127,7 +148,7 @@ class KicadSchSymbol (object):
                     raise ValueError ("cannot interpret line: " + line)
 
             elif state == "fplist":
-                if line == "$ENDFPLIST\n":
+                if line == "$ENDFPLIST":
                     state = "root"
                 else:
                     newobj.footprintFilters.extend (i.strip () for i in line.split ())
@@ -150,6 +171,24 @@ class KicadSchSymbol (object):
                 else:
                     raise ValueError ("cannot interpret line: " + line)
 
+    # KiCad has some horrid data duplication that means a few things must be
+    # edited in multiple places. Use these properties whenever you can to fix
+    # that.
+    @property
+    def name (self):
+        return self.definition.name
+    @name.setter
+    def name (self, v):
+        self.definition.name = v
+        self.valueField.text = v
+
+    @property
+    def reference (self):
+        return self.definition.reference
+    @reference.setter
+    def reference (self, v):
+        self.definition.reference = v
+        self.referenceField.text = v
 
 
 class Definition (object):
@@ -173,12 +212,12 @@ class Definition (object):
             dnums = ("Y" if self.draw_numbers else "N"),
             dnames = ("Y" if self.draw_names else "N"),
             units = self.unit_count,
-            locked = ("L" if self.unit_locked else "F"),
+            locked = ("L" if self.units_locked else "F"),
             power = ("P" if self.is_power else "N")))
 
 class Field (object):
     def __init__ (self, line):
-        line = line.split ()
+        line = shlex.split (line)
         self.num = int (line[0][1:])
         self.text = line[1]
         self.posx = int (line[2])
@@ -190,7 +229,7 @@ class Field (object):
         self.vert_just = line[8] # L R or C
 
     def writeOut (self, f):
-        line = "F{num} {text} {posx} {posy} {size} {orient} {visible} {hjust} {vjust}\n"
+        line = "F{num} \"{text}\" {posx} {posy} {size} {orient} {visible} {hjust} {vjust}\n"
         f.write (line.format (
             num = self.num,
             text = self.text,
@@ -266,9 +305,9 @@ class Polyline (object):
         self.thickness = int(line[4])
         self.fill = KICAD_TO_FILL[line[-1]]
         
-        points = line[5:-1]
+        points = [int(i) for i in line[5:-1]]
         # Pairwise (x y) (x y)
-        self.points = zip (points[::2], points[1::2])
+        self.points = list (zip (points[::2], points[1::2]))
 
     def writeOut (self, f):
         line = "P {npoints} {unit} {convert} {thickness} {points} {fill}\n"
@@ -277,8 +316,8 @@ class Polyline (object):
             unit = self.unit,
             convert = self.convert,
             thickness = self.thickness,
-            fill = self.fill,
-            points = " ".join("%d %d" % i for i in self.points)))
+            fill = FILL_TO_KICAD[self.fill],
+            points = " ".join(" %d %d" % i for i in self.points)))
 
 class Rectangle (object):
     def __init__ (self, line):
@@ -322,7 +361,7 @@ class Text (object):
         self.vert_just = line[12]
 
     def writeOut (self, f):
-        line = "T {vert} {posx} {posy} {size} 0 {unit} {conv} {text} {italic} {bold} {hjust} {vjust}\n"
+        line = "T {vert} {posx} {posy} {size} 0 {unit} {conv} {text}  {italic} {bold} {hjust} {vjust}\n"
 
         f.write (line.format (
             vert = (900 if self.vertical else 0),
@@ -352,7 +391,7 @@ class Pin (object):
         self.unit = int (line[9])
         self.convert = int (line[10])
         self.elec_type = line[11]
-        if len (line) > 11:
+        if len (line) > 12:
             self.style = line[12]
         else:
             self.style = None
@@ -373,4 +412,35 @@ class Pin (object):
             convert = self.convert,
             elec_type = self.elec_type,
             style = ("" if self.style is None else (" " + self.style))))
+
+
+def script1():
+    # open conn-100mil.lib.old and split the CONN-100MIL-M-* into shrouded and
+    # unshrouded versions
+    import copy
+    with open ("conn-100mil.lib.old") as f:
+        symbs = readfile (f)
+
+    newsymbs = []
+    for i in symbs:
+        if i.definition.name.startswith ("CONN-100MIL-M"):
+            i.footprintFilters.remove (i.definition.name + "-SHROUD")
+            i.footprintField.text = "conn-100mil:" + i.footprintFilters[0]
+            i.footprintField.visible = False
+
+            shrouded = copy.deepcopy (i)
+            shrouded.name = shrouded.name + "-SHROUD"
+            shrouded.footprintFilters[0] += "-SHROUD"
+            shrouded.footprintField.text = "conn-100mil:" + shrouded.footprintFilters[0]
+            newsymbs.append (shrouded)
+        else:
+            i.footprintField.text = "conn-100mil:" + i.footprintFilters[0]
+            i.footprintField.visible = False
+    symbs.extend (newsymbs)
+
+    with open ("conn-100mil.lib", "w") as f:
+        writefile (f, symbs)
+
+if __name__ == '__main__':
+    script1 ()
 
